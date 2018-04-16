@@ -238,7 +238,7 @@ duplicates on file hashes. From Wikipedia:
 given n random integers drawn from a discrete uniform distribution with range
 [1,d], what is the probability p(n;d) that at least two numbers are the same?
 
-<img align="center" src="./assets/birthday_paradox.gif">
+.. image:: ./assets/birthday_paradox.gif
 
 Plugging in the numbers for 1,000,000 files and a 32 bit hash yields a 100%
 probability of collisions. 100,000 files gives a 69% probability. In the app,
