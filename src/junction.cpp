@@ -2,7 +2,7 @@
 
 #ifndef WIN32
 
-bool is_junction(const boost::filesystem::wpath& dir_path)
+bool isJunction(const boost::filesystem::wpath& dirPath)
 {
   return false;
 }
@@ -98,9 +98,9 @@ BOOL IsDirectoryJunction(LPCWSTR pszDir)
   return br ? (ReparseBuffer.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) : FALSE;
 }
 
-bool is_junction(const boost::filesystem::wpath& dir_path)
+bool isJunction(const boost::filesystem::wpath& dirPath)
 {
-  return IsDirectoryJunction(dir_path.native().c_str()) == TRUE;
+  return IsDirectoryJunction(dirPath.native().c_str()) == TRUE;
 }
 
 #endif

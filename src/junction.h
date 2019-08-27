@@ -1,3 +1,3 @@
 #include "pch.h"
 
-bool is_junction(const boost::filesystem::wpath&);
+bool isJunction(const boost::filesystem::wpath&);

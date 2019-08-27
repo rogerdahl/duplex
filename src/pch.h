@@ -1,10 +1,12 @@
 #pragma once
 //#pragma message("Compiling PCH - Should only happen once per project")
 
-// misc
+// Misc
 #define _CRT_SECURE_NO_DEPRECATE
 #define _SCL_SECURE_NO_DEPRECATE
 #include "targetver.h"
+#include <fmt/format.h>
+#include <fmt/ostream.h>
 
 // Boost
 #define BOOST_FILESYSTEM_VERSION 3
@@ -26,6 +28,7 @@
 #include <fstream>
 #include <list>
 #include <map>
+#include <utility>
 
 #ifdef WIN32
 #include <hash_map>

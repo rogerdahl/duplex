@@ -1,1 +1,5 @@
-u64 fnv_1a_64(const boost::filesystem::wpath& path);
+#include "pch.h"
+
+typedef std::string Hash;
+
+Hash fnv1A64(const boost::filesystem::wpath& path);

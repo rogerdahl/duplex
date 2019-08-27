@@ -77,7 +77,7 @@ namespace
   //{
   //    return memset(dst, c, size);
   //}
-}
+} // namespace
 
 md5::md5()
 {
@@ -168,9 +168,8 @@ void md5::update(const void* a_data, u32 a_data_size)
 
     for (input_index = buffer_space; input_index + 63 < a_data_size;
          input_index += 64) {
-      process_block(
-        reinterpret_cast<const u8(*)[64]>(
-          reinterpret_cast<const u8*>(a_data) + input_index));
+      process_block(reinterpret_cast<const u8(*)[64]>(
+        reinterpret_cast<const u8*>(a_data) + input_index));
     }
 
     buffer_index = 0;
@@ -351,7 +350,7 @@ namespace
     a += I(b, c, d) + x + ac;
     a = rotate_left(a, s) + b;
   }
-}
+} // namespace
 
 void md5::process_block(const u8 (*a_block)[64])
 {
@@ -444,4 +443,4 @@ void md5::process_block(const u8 (*a_block)[64])
   // Zeroize sensitive information.
   // secure_memset(reinterpret_cast<u8*>(x), 0, sizeof(x));
 }
-}
+} // namespace boost

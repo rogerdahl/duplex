@@ -1,16 +1,20 @@
 // Duplex - Delete duplicate files
 
+#pragma clang diagnostic push
+//#pragma ide diagnostic ignored "modernize-pass-by-value"
+//#pragma clang diagnostic ignored "-Wshadow"
+
 #include "pch.h"
 
-#include "md5.hpp"
 #include "fnv_1a_64.h"
 #include "junction.h"
+#include <z3.h>
+
+#include "md5.hpp"
 
 #ifndef WIN32
 using namespace __gnu_cxx;
-#endif
-
-#ifdef WIN32
+#else
 using namespace stdext;
 #endif
 
@@ -19,1159 +23,1020 @@ using namespace boost;
 using namespace boost::filesystem;
 using namespace boost::program_options;
 
-// Program arguments
+// Command line args
+vector<path> PATH_VEC_ARG;
+vector<path> RECURSIVE_PATH_VEC_ARG;
+vector<path> MD5_PATH_VEC_ARG;
+vector<string> RULE_VEC_ARG;
+bool AUTOMATIC_ARG(false);
+bool VERBOSE_ARG(false);
+bool QUIET_ARG(false);
+bool DEBUG_ARG(false);
+bool USE_MD5_ARG(false);
+bool DRY_RUN_ARG(false);
+size_t IGNORE_SMALLER_ARG((size_t)-1), IGNORE_LARGER_ARG((size_t)-1);
 
-vector<string> folder_args;
-vector<string> rfolder_args;
-vector<string> md5list_args;
-vector<string> rule_args;
-string search, file;
-bool automatic(false);
-bool verbose(false);
-bool quiet(false);
-bool debug(false);
-bool use_md5(false);
-bool query(false);
-bool dry_run(false);
-bool remove_empty(false);
-u64 smaller(-1), bigger(-1);
+typedef string Hash;
 
-// Hold one rule
-struct rule
-{
-  rule(regex rx, string rx_str) : rx(rx), rx_str(rx_str)
+// Compare functions for regular sort operations do not need any context beyond the value pairs that
+// the sort function passes in. This class is created before the sort and stores GroupMap context,
+// allowing HashToGroupMap by be sorted by FileInfo in the GroupMap.
+template <typename GroupMap> class CompareGroupsByHash {
+public:
+  explicit CompareGroupsByHash(GroupMap groupMap) : groupMap(groupMap)
   {
   }
-  regex rx;
-  string rx_str;
-};
 
-struct hash_string
-{
-  // Parameters for hash table
-  enum
+  // All files in a group share the same size. If the files in the two groups have different sizes,
+  // use that for sorting. If they're the same, fall back to comparing the first path in each
+  // FileVec as a tie breaker. The FileVecs for each group should themselves be sorted first.
+  bool operator()(const Hash &a, const Hash &b) const
   {
-    bucket_size = 4,
-    min_buckets = 8
-  };
-  // Hash string s1 to size_t value
-  size_t operator()(const string& s1) const
-  {
-    const unsigned char* p = (const unsigned char*)s1.c_str();
-    size_t hashval = 0;
-    for (size_t n = s1.size(); 0 < n; --n)
-      hashval += *p++;
-    return (hashval);
+    auto groupA = groupMap.at(a);
+    auto groupB = groupMap.at(b);
+    if (groupA[0].size == groupB[0].size) {
+      return groupA[0].itemPath > groupB[0].itemPath;
+    }
+    return groupA[0].size > groupB[0].size;
   }
-  // Test if s1 ordered before s2
-  bool operator()(const string& s1, const string& s2) const
-  {
-    return (s1 < s2);
-  }
-};
 
-// Hash function for s64
-struct hash_s64
-{
-  // Parameters for hash table
-  enum
-  {
-    bucket_size = 4,
-    min_buckets = 8
-  };
-  // Hash s64 s1 to size_t value
-  size_t operator()(const s64& s1) const
-  {
-    return ((size_t)s1);
-  }
-  // Test if s1 ordered before s2
-  bool operator()(const s64& s1, const s64& s2) const
-  {
-    return (s1 < s2);
-  }
+private:
+  GroupMap groupMap;
 };
 
 // Hold one file entry
-struct dup_file
-{
-  dup_file(path path_inst, u64 size, string hash)
-    : path_inst(path_inst), size(size), hash(hash)
+class FileInfo {
+public:
+  FileInfo(path itemPath, size_t size, string hash)
+    : itemPath(std::move(itemPath)), size(size), hash(hash)
   {
   }
-  path path_inst;
-  u64 size;
-  string hash;
+
+  FileInfo(path itemPath, size_t size) : itemPath(std::move(itemPath)), size(size)
+  {
+  }
+
+  string str()
+  {
+    if (hash.empty()) {
+      return fmt::format("{:>14n} {}", size, itemPath.native());
+    }
+    else {
+      return fmt::format("{:>14n} {} {}", size, string(hash), itemPath.native());
+    }
+  }
+
+  path itemPath;
+  size_t size;
+  string hash{""};
 };
 
-// Types
+typedef vector<FileInfo> FileVec;
 
-// Hold list of files in one group. It's important that this is a list and not
-// another sequence, as we rely on iterators into the list remaining valid even
+// Hold vector of files in one group. It's important that this is a vector and not
+// another sequence, as we rely on iterators into the vector remaining valid even
 // when items are removed.
-typedef list<dup_file> group_t;
+typedef vector<FileInfo> Group;
 
 // Map that files are initially put into when they're found. It both orders and
-// groups files by filesize.
-typedef map<u64, group_t> filemap_t;
+// groups files by file_size.
+typedef map<size_t, Group> SizeToGroupMap;
 
-// List of pointers to the individual files in the file_map
-typedef list<dup_file*> filelist_t;
+// Hash of vectors of files is the map that files are put into after
+// files with unique file lengths are eliminated. It groups files by
+// hash.
+typedef unordered_map<Hash, Group> HashToGroupMap;
 
-typedef unordered_map<string, group_t, hash_string> groupmap_t;
-
-typedef list<rule> rulelist_t;
+// Vec that keeps the order that the group_maps were created in. Because
+// file_map is a map sorted by file_size, group_walker is also sorted. This
+// enables us to move back and forth in groups based on file size, and to put
+// the group with the largest files first.
+typedef vector<Hash> GroupsBySizeVec;
 
 // A file_ref points to a specific file in a specific group
-typedef pair<groupmap_t::iterator, group_t::iterator> file_ref_t;
-typedef deque<file_ref_t> file_refs_t;
+// typedef pair<HashToGroupMap::iterator, Group::iterator> FileRef;
+// typedef deque<FileRef> FileRefs;
 
-filemap_t file_map;
-
-// Display a file with size and path_inst
-format filesize_row("%12d %s");
-format filesize_hash_row("%12d %s %s");
-
-// hold total stats
-struct total_stats_t
-{
-  total_stats_t()
-    : num_total(0),
-      num_dup(0),
-      num_marked(0),
-      num_manual(0),
-      num_full_marked(0),
-      size_total(0),
-      size_dup(0),
-      size_marked(0)
+class Rules {
+public:
+  void addRegexRule(const string &arg)
   {
+    assertNotEmpty(arg);
+    assertNotExists(regexStrVec, arg);
+    try {
+      regexVec.emplace_back(arg, regbase::perl | regbase::icase);
+    }
+    catch (std::exception &e) {
+      throw std::runtime_error(fmt::format("Invalid regular expression: {}"));
+    }
+    regexStrVec.push_back(arg);
+    pathVec.emplace_back();
   }
-  u32 num_total;
-  u32 num_dup;
-  u32 num_marked;
-  u32 num_manual;
-  u32 num_full_marked;
-  u64 size_total;
-  u64 size_dup;
-  u64 size_marked;
+
+  void addPathRule(const path &arg)
+  {
+    assertNotEmpty(arg);
+    assertNotExists(pathVec, arg);
+    regexVec.emplace_back();
+    regexStrVec.emplace_back("");
+    pathVec.push_back(arg);
+  }
+
+  void eraseRule(size_t idx)
+  {
+    regexVec.erase(regexVec.begin() + idx);
+    regexStrVec.erase(regexStrVec.begin() + idx);
+    pathVec.erase(pathVec.begin() + idx);
+  }
+
+  void clear() {
+    regexVec.clear();
+    regexStrVec.clear();
+    pathVec.clear();
+  }
+
+  // Determine if fileInfo matches any of the current rules.
+  [[nodiscard]] bool isMatch(const FileInfo &fileInfo) const
+  {
+    size_t idx = 0;
+    for (auto &rule : pathVec) {
+      if (!rule.empty()) {
+        if (fileInfo.itemPath.native() == rule.native()) {
+          return true;
+        }
+      }
+      else {
+        if (regex_search(fileInfo.itemPath.native(), regexVec[idx])) {
+          return true;
+        }
+      }
+      ++idx;
+    }
+    return false;
+  }
+
+  [[nodiscard]] vector<string> getRulesForDisplay() const
+  {
+    vector<string> r;
+    size_t idx = 0;
+    for (auto &p : pathVec) {
+      if (!p.empty()) {
+        r.push_back(fmt::format("path:  {}", p.native()));
+      }
+      else {
+        r.push_back(fmt::format("regex: {}", regexStrVec[idx]));
+      }
+      ++idx;
+    }
+    return r;
+  }
+
+  //  bool isPathRule(size_t idx) {
+  //    return !pathVec[idx].empty();
+  //  }
+
+  //  void eraseRule(const string& arg) {
+  //    size_t idx = getIndex(regexStrVec, arg);
+  //    if (idx != -1) {
+  //      eraseIndex(regexStrVec, idx);
+  //      eraseIndex(regexVec, idx);
+  //    }
+  //  }
+
+  //  template<typename T, typename X>
+  //  size_t getIndex(const T& v, const X& arg)
+  //  {
+  //    size_t idx = 0;
+  //    for (auto &a : v) {
+  //      if (a == arg) {
+  //        return idx;
+  //      }
+  //      ++idx;
+  //    }
+  //    return -1;
+  //  }
+
+  //  template<typename T>
+  //  size_t eraseIndex(const T& v, size_t idx)
+  //  {
+  //    v.erase(v.begin() + idx);
+  //  }
+
+  size_t getRuleCount()
+  {
+    return pathVec.size();
+  }
+
+  template <typename T, typename X> void assertNotExists(const T &v, const X &arg)
+  {
+    for (auto &a : v) {
+      if (a == arg) {
+        throw std::runtime_error(fmt::format("Rule already exists: {}", arg));
+      }
+    }
+  }
+
+  template <typename T> void assertNotEmpty(T arg)
+  {
+    if (arg.empty()) {
+      throw std::runtime_error(fmt::format("Missing rule argument"));
+    }
+  }
+
+private:
+  vector<regex> regexVec;
+  vector<string> regexStrVec;
+  vector<path> pathVec;
 };
 
-// Declarations
+timer LAST_STATUS_TIME;
 
-void parse_command_line(int argc, char* argv[]);
-bool compare_dup_file(dup_file* _first, dup_file* _second);
-void verify_valid_folders();
-void get_marked(
-  groupmap_t::iterator& groupmap_iter, group_t& group, rulelist_t& rules,
-  file_refs_t& files, total_stats_t& total_stats);
-bool add_folder(
-  const path& dir_path_inst, const bool recursive, const bool verbose,
-  const bool quiet, u64 smaller, u64 bigger, bool debug);
-bool add_folder_recursive(
-  const path& dir_path_inst, const bool recursive, const bool verbose,
-  const bool quiet, u64 smaller, u64 bigger, timer& time, u64& file_cnt);
-bool add_md5list(
-  const path& md5deep_file, const bool verbose, const bool quiet, u64 smaller,
-  u64 bigger, bool debug);
+class Stats {
+public:
+  Stats()
+    : totalCount(0), dupCount(0), markedCount(0), totalBytes(0), dupBytes(0), markedBytes(0),
+      groupCount(0)
+  {
+  }
 
-int main(int argc, char* argv[])
+  void operator+=(const Stats &other)
+  {
+    totalCount += other.totalCount;
+    dupCount += other.dupCount;
+    markedCount += other.markedCount;
+    totalBytes += other.totalBytes;
+    dupBytes += other.dupBytes;
+    markedBytes += other.markedBytes;
+    groupCount += other.groupCount;
+  }
+
+  size_t totalCount;
+  size_t dupCount;
+  size_t markedCount;
+  size_t totalBytes;
+  size_t dupBytes;
+  size_t markedBytes;
+  size_t groupCount;
+};
+
+// Verify command line args
+void verifyDirPaths();
+bool isInvalidDirPath(const path &p);
+// Find all files that will be checked for duplicates.
+FileVec findAllFiles();
+void addPath(FileVec &fileVec, const path &itemPath, const bool &recursive);
+void addMd5File(FileVec &fileVec, const path &md5DeepPath);
+void addFile(FileVec &fileVec, const path &filePath);
+void displayFindStatus(const FileVec &fileVec, bool forceDisplay = false);
+// Group files by size and remove single item groups (files with unique sizes can't have dups)
+SizeToGroupMap groupFilesBySize(const FileVec &fileVec);
+template <typename GroupMap> void removeSingleItemGroups(GroupMap &groupMap);
+// Hash all remaining files, as they may have dups.
+void hashAll(FileVec &fileVec);
+void calculateHash(FileInfo &fileInfo);
+void displayHashStatus(const FileInfo &fileInfo, size_t accumulatedSize, size_t totalSize,
+  size_t fileCount, size_t fileIdx);
+size_t getTotalSizeOfUnhashed(FileVec &fileVec);
+// Group files again, this time by hash, and again remove single item groups.
+HashToGroupMap groupFilesByHash(const FileVec &fileVec);
+// Rules
+void addRulesFromCommandLine(Rules &rules);
+// Add rules interactively
+void sortAllFileInfoVec(HashToGroupMap &hashToGroupMap);
+GroupsBySizeVec sortGroupsBySize(const HashToGroupMap &hashToGroupMap);
+void addRulesInteractive(Rules &rules, HashToGroupMap &groupMap);
+size_t argToIdx(const string &arg, const size_t &maxIdx);
+size_t goToGroup(size_t groupIdx, size_t groupCount, const string &cmd);
+void refreshGroups(GroupsBySizeVec &groupsBySize, HashToGroupMap &groupMap);
+void commandPrompt(string &cmd, string &arg, size_t groupIdx, size_t groupCount);
+void displayRules(const Rules &rules);
+void displayGroup(const FileVec &fileVec, const Rules &rules, size_t groupIdx, size_t groupCount);
+void displayHelp();
+void displayTotalStats(const Stats &stats);
+// Delete files marked by the rules.
+bool confirmDeletePrompt(const Stats &totalStats);
+void deleteMarkedFiles(HashToGroupMap &groupMap, const Rules &rules);
+bool deleteFile(const FileInfo &fileInfo);
+void displayDeleteStatus(const Stats &totalStats, size_t deleteIdx, size_t deletedCount);
+// Misc
+Stats getGroupStats(const FileVec &fileVec, const Rules &rules);
+Stats getTotalStats(const HashToGroupMap &groupMap, const Rules &rules);
+// Locale and command line.
+void setupLocale();
+void parseCommandLine(int argc, char **argv);
+void procCommand(size_t &groupIdx, bool &doDisplayHelp, Rules &rules, const Stats &totalStats,
+  const FileVec &groupFileVec, const string &cmd, const string &arg, HashToGroupMap &groupMap);
+// Print only when called with --verbose.
+template <typename... Args> void vprint(const char *fmt, Args &&... args)
 {
-  parse_command_line(argc, argv);
-
-  // Switch from C locale to user's locale
-  // will be used for all new streams
-  std::locale::global(std::locale(""));
-  // This stream was already created, so must imbue
-  cout.imbue(locale(""));
-
-  verify_valid_folders();
-
-  // Build database of files to process
-
-  // Add all files in search folders, non-recursive
-  for (vector<string>::iterator i = folder_args.begin(); i != folder_args.end();
-       ++i) {
-    cout << "Processing non-recursive: " << *i << endl;
-    add_folder(
-      path(*i), false /* not recursive */, verbose, quiet, smaller, bigger,
-      debug);
+  if (VERBOSE_ARG) {
+    fmt::print(fmt, std::forward<Args>(args)...);
   }
+}
 
-  // Add all files in search folders, recursive
-  for (vector<string>::iterator i = rfolder_args.begin();
-       i != rfolder_args.end(); ++i) {
-    cout << "Processing recursive: " << *i << endl;
-    add_folder(
-      path(*i), true /* recursive */, verbose, quiet, smaller, bigger, debug);
+int main(int argc, char *argv[])
+{
+  setupLocale();
+  parseCommandLine(argc, argv);
+  verifyDirPaths();
+  auto fileVec = findAllFiles();
+  vprint("fileVec size: {:n}\n", fileVec.size());
+  auto sizeToGroupMap = groupFilesBySize(fileVec);
+  vprint("sizeToGroupMap size: {:n}\n", sizeToGroupMap.size());
+  removeSingleItemGroups(sizeToGroupMap);
+  vprint("sizeToGroupMap size: {:n}\n", sizeToGroupMap.size());
+  hashAll(fileVec);
+  auto hashToGroupMap = groupFilesByHash(fileVec);
+  sortAllFileInfoVec(hashToGroupMap);
+  // Vec of marking rules
+  Rules rules;
+  addRulesFromCommandLine(rules);
+  // Set up rules for selecting files to delete
+  if (!AUTOMATIC_ARG) {
+    addRulesInteractive(rules, hashToGroupMap);
   }
-
-  // Add all files provided as md5 lists
-  for (vector<string>::iterator i = md5list_args.begin();
-       i != md5list_args.end(); ++i) {
-    cout << "Processing md5 list: " << *i << endl;
-    add_md5list(path(*i), verbose, quiet, smaller, bigger, debug);
+  else {
+    deleteMarkedFiles(hashToGroupMap, rules);
   }
-
-  // Remove files that have unique size (optimization -- they can't have
-  // duplicates so no need to MD5 them)
-  u32 unique_size_cnt(0);
-  for (filemap_t::iterator filemap_iter = file_map.begin();
-       filemap_iter != file_map.end();) {
-    if (filemap_iter->second.size() <= 1) {
-      // Erasing an element from a map also not invalidate any iterators, except
-      // for iterators that actually point to the element that is being erased.
-      file_map.erase(filemap_iter++);
-      ++unique_size_cnt;
-    }
-    else {
-      ++filemap_iter;
-    }
-  }
-  verbose&& cout << "Removed " << unique_size_cnt
-                 << " file entries based on unique file size" << endl;
-
-  // Show debug info about file_map
-  if (debug) {
-    cout << "Debug: file_map after unique size optimization:" << endl;
-    cout << "Debug: file_map size: " << file_map.size() << endl;
-    cout << "Debug: file_map max size: " << file_map.max_size() << endl;
-  }
-
-  // Hash of lists of files is the map that files are put into after
-  // files with unique file lenghts are eliminated. It groups files by
-  // hash.
-  groupmap_t groupmap;
-
-  // List that keeps the order that the groupmaps were created in. Because
-  // file_map is a map sorted by filesize, groupwalker is also sorted. This
-  // enables us to move back and forth in groups based on file size, and to put
-  // the group with the biggest files first.
-  typedef list<string> groupwalker_t;
-  groupwalker_t groupwalker;
-
-  // Sum up file sizes and number of files (for progress display)
-  u64 totsize(0);
-  u64 numfiles(0);
-  for (filemap_t::iterator filemap_iter = file_map.begin();
-       filemap_iter != file_map.end(); ++filemap_iter) {
-    for (group_t::iterator group_iter = filemap_iter->second.begin();
-         group_iter != filemap_iter->second.end(); ++group_iter) {
-      totsize += group_iter->size;
-      ++numfiles;
-    }
-  }
-
-  // We want to hash the files in the same order as we found them in the
-  // filesystem because processing them in that order is much faster than
-  // jumping ramdomly around in the filesystem, as we would if we were to
-  // process them by filesize.
-
-  // Create a list of pointers to the dup_file entries and sort that list
-  filelist_t filelist;
-  for (filemap_t::iterator filemap_iter = file_map.begin();
-       filemap_iter != file_map.end(); ++filemap_iter) {
-    for (group_t::iterator group_iter = filemap_iter->second.begin();
-         group_iter != filemap_iter->second.end(); ++group_iter) {
-      filelist.push_back(&*group_iter);
-    }
-  }
-  filelist.sort(compare_dup_file);
-
-  // Calculate hashes for all files
-  u64 so_far_size(0);
-  u64 file_cnt(0);
-  timer time;
-  for (filelist_t::iterator filelist_iter = filelist.begin();
-       filelist_iter != filelist.end(); ++filelist_iter) {
-    ++file_cnt;
-    string hash;
-    try {
-      if ((*filelist_iter)->hash == "") {
-        if (use_md5) {
-          boost::filesystem::ifstream file(
-            (*filelist_iter)->path_inst, ios::binary);
-          string ck(md5(file).digest().hex_str_value());
-          string wck(ck.begin(), ck.end());
-          (*filelist_iter)->hash = wck;
-        }
-        else {
-          u64 fnv_hash(fnv_1a_64((*filelist_iter)->path_inst));
-          (*filelist_iter)->hash = str(format("%x") % fnv_hash);
-        }
-        verbose&& cout << (use_md5 ? "MD5: " : "FNV64: ")
-                       << str(
-                            filesize_hash_row % (*filelist_iter)->size
-                            % (*filelist_iter)->hash
-                            % (*filelist_iter)->path_inst.native())
-                       << endl;
-      }
-      // Display status
-      so_far_size += (*filelist_iter)->size;
-      if (!quiet && totsize && (time.elapsed() >= 1.0 || so_far_size == totsize)) {
-        cout << fixed << setprecision(2) << "Calculating "
-             << (use_md5 ? "MD5" : "FNV64") << " hashes:\n"
-             << "Data: " << (float)so_far_size / (float)totsize * 100 << "% ("
-             << so_far_size << " / " << totsize << " bytes)\n"
-             << "Files: " << (float)file_cnt / (float)numfiles * 100 << "% ("
-             << file_cnt << " / " << numfiles << " files)\n"
-             << endl;
-        time.restart();
-      }
-    } catch (boost::filesystem::ifstream::failure e) {
-      cout << "Skipped file: " << (*filelist_iter)->path_inst.native() << endl;
-      cout << "Cause: " << e.what() << endl;
-    } catch (const filesystem_error& e) {
-      cout << "Skipped file: " << (*filelist_iter)->path_inst.native() << endl;
-      cout << "Cause: " << e.what() << endl;
-    } catch (const string& s) {
-      cout << "Skipped file: " << (*filelist_iter)->path_inst.native() << endl;
-      cout << "Cause: " << s << endl;
-    } catch (...) {
-      cout << "Skipped file: " << (*filelist_iter)->path_inst.native() << endl;
-      cout << "Cause: Unknown exception" << endl;
-    }
-  }
-  filelist.clear();
-
-  // Build database of duplicates
-  for (filemap_t::iterator filemap_iter = file_map.begin();
-       filemap_iter != file_map.end();) {
-    for (group_t::iterator group_iter = filemap_iter->second.begin();
-         group_iter != filemap_iter->second.end(); ++group_iter) {
-      string hash_and_size(
-        group_iter->hash + str(format("%d") % group_iter->size));
-      groupmap[hash_and_size].push_back(
-        dup_file(group_iter->path_inst, group_iter->size, ""));
-      // If this is the first file added to groupmap, we add the group to the
-      // walker.
-      if (groupmap[hash_and_size].size() == 1) {
-        groupwalker.push_front(hash_and_size);
-      }
-    }
-    // Erasing an element from a map does not invalidate any iterators except
-    // for iterators that point to the element that is being erased.
-    file_map.erase(filemap_iter++);
-  }
-  // Free memory used for the initial file map
-  file_map.clear();
-
-  // Show debug info about group map
-  if (debug) {
-    cout << "Debug: groupmap size: " << groupmap.size() << endl;
-    cout << "Debug: groupmap max size: " << groupmap.max_size() << endl;
-  }
-
-  // Add the rules given on the command line
-
-  // List of marking rules
-  rulelist_t rulelist;
-
-  for (vector<string>::iterator i = rule_args.begin(); i != rule_args.end();
-       ++i) {
-    try {
-      rulelist.push_back(rule(regex(*i, regbase::perl | regbase::icase), *i));
-    } catch (...) {
-      cout << "Error: \"" << *i << "\" is not a valid regular expression"
-           << endl;
-      exit(1);
-    }
-  }
-
-  // Interactive
-
-  format file_row("%3d %c %12d %s");
-  format rule_row("%3d %s");
-  bool display_rules(!quiet);
-  bool display_help(false);
-  bool displaystatus(!quiet);
-  bool cleangroups(true);
-  bool did_delete(false);
-  size_t walkpos(1);
-
-  // Go to first group (the one with the biggest file sizes)
-  groupwalker_t::iterator groupwalker_iter(groupwalker.begin());
-  walkpos = 1;
-
-  // Start interactive section
-  for (;;) {
-    // Remove groups with only one file
-    if (cleangroups) {
-      cleangroups = false;
-      u32 cnt_removed(0);
-      for (groupwalker_t::iterator iter(groupwalker.begin());
-           iter != groupwalker.end();) {
-        if (groupmap[*iter].size() <= 1) {
-          groupmap.erase(*iter);
-          groupwalker.erase(iter++);
-          ++cnt_removed;
-        }
-        else {
-          ++iter;
-        }
-      }
-      // Set walker to first group
-      groupwalker_iter = groupwalker.begin();
-      walkpos = 1;
-      verbose&& cnt_removed&& cout << "Removed " << cnt_removed
-                                   << " groups with only one member" << endl;
-    }
-
-    // Exit if no more groups
-    if (!groupmap.size()) {
-      if (!quiet) {
-        if (did_delete) {
-          cout << "No more duplicates" << endl;
-        }
-        else {
-          cout << "No duplicates found" << endl;
-        }
-      }
-      break;
-    }
-
-    // Shortcuts for this group
-    string groupkey(*groupwalker_iter);
-    group_t& group(groupmap[groupkey]);
-
-    if (displaystatus) {
-      displaystatus = false;
-
-      total_stats_t total_stats;
-      for (groupmap_t::iterator groupmap_iter = groupmap.begin();
-           groupmap_iter != groupmap.end(); ++groupmap_iter) {
-        file_refs_t files;
-        get_marked(
-          groupmap_iter, groupmap_iter->second, rulelist, files, total_stats);
-      }
-
-      format status_row("%18d %s");
-      cout << endl;
-      cout << "Status:" << endl << endl;
-      cout << str(status_row % total_stats.num_total % "files") << endl;
-      cout << str(status_row % total_stats.num_dup % "duplicates") << endl;
-      cout << str(status_row % total_stats.num_marked % "marked files") << endl;
-      cout << str(status_row % groupmap.size() % "groups") << endl;
-      //			cout << str(status_row % num_manual      % "manual groups") <<
-      // endl;
-      cout << str(status_row % total_stats.size_total % "bytes in all groups")
-           << endl;
-      cout << str(status_row % total_stats.size_dup % "bytes in duplicates")
-           << endl;
-      cout << str(
-                status_row % total_stats.size_marked
-                % "bytes in all marked files")
-           << endl;
-      // if (num_full_marked)
-      //	cout << str(status_row % num_full_marked % "groups with ALL marked
-      //(warning!)") << endl;
-      cout << str(
-                status_row
-                % ((float)total_stats.num_total / (float)groupmap.size())
-                % "files per group (average)")
-           << endl;
-    }
-
-    if (display_help) {
-      display_help = false;
-      cout << "Interactive mode commands:" << endl << endl;
-      cout << "f, first          : go to first group" << endl;
-      cout << "l, last           : go to last group" << endl;
-      cout << "p, previous       : go to previous group" << endl;
-      cout << "n, next, <Enter>  : go to next group" << endl;
-      //			cout << "t, toggle <index> : toggle mark on file with given index"
-      //<< endl;
-      cout << "c, clear          : remove all manual editing" << endl;
-      cout << "r, rules          : list rules" << endl;
-      cout
-        << "a, add <rule>     : add rule (case insensitive regular expression)"
-        << endl;
-      cout << "b, file <file #>  : add rule (file number)" << endl;
-      cout << "d, remove <index> : remove rule" << endl;
-      cout << "h, help, ?        : display this message" << endl;
-      cout << "s, status         : display status" << endl;
-#ifdef WIN32
-      cout << "o, open <index>   : open file" << endl;
-#endif
-      cout << "quit, exit        : exit program without deleting anything"
-           << endl;
-      cout << "delete            : delete all marked files" << endl;
-      cout << endl;
-    }
-
-    // Display existing rules if previous command was a rule add or delete
-    // command
-    if (display_rules) {
-      display_rules = false;
-      cout << "Rules:" << endl << endl;
-      if (!rulelist.size()) {
-        cout << "No rules defined" << endl;
-      }
-      else {
-        // Display existing rules
-        int c(0);
-        for (list<rule>::iterator iter = rulelist.begin();
-             iter != rulelist.end(); ++iter) {
-          cout << str(rule_row % ++c % iter->rx_str) << endl;
-        }
-      }
-      cout << endl;
-    }
-
-    // Get command, or hardwire delete command if automatic mode
-    string cmd, cmdarg;
-    if (!automatic) {
-      // Display list of files in group and mark status
-      total_stats_t group_stats;
-      groupmap_t::iterator dummy_iter = groupmap.begin();
-      file_refs_t files;
-      get_marked(dummy_iter, group, rulelist, files, group_stats);
-
-      cout << endl;
-      u32 cnt_files(0);
-      for (group_t::iterator group_iter = group.begin();
-           group_iter != group.end(); ++group_iter) {
-        bool marked(
-          find(files.begin(), files.end(), file_ref_t(dummy_iter, group_iter))
-          != files.end());
-        cout << str(
-                  file_row % ++cnt_files % (marked ? '*' : ' ')
-                  % group_iter->size % group_iter->path_inst.native())
-             << endl;
-      }
-
-      cout << endl;
-      format status_row("%18d %s");
-      cout << str(status_row % group_stats.size_total % "bytes in group")
-           << endl;
-      cout << str(status_row % group_stats.size_dup % "bytes in duplicates")
-           << endl;
-      cout << str(
-                status_row % group_stats.size_marked % "bytes in marked files")
-           << endl;
-
-      // Get command
-      string cmdline;
-      cout << endl;
-      cout << walkpos << " / " << groupwalker.size() << " > " << flush;
-      getline(cin, cmdline);
-      // Split command into command and argument
-      size_t space_idx = cmdline.find(" ");
-      cmd = cmdline.substr(0, space_idx);
-      trim(cmd);
-      if (space_idx != -1) {
-        cmdarg = cmdline.substr(space_idx);
-        trim(cmdarg);
-      }
-    }
-    else {
-      // automatic
-      cmd = "delete";
-    }
-    // display rules
-    if (cmd == "r" || cmd == "rule") {
-      // Flag display rules after all rules have been added
-      display_rules = true;
-    }
-    // Add rule (regex)
-    else if (cmd == "a" || cmd == "add") {
-      if (cmdarg == "") {
-        cout << "Error: Missing rule argument" << endl;
-        display_help = true;
-        continue;
-      }
-      try {
-        rulelist.push_back(
-          rule(regex(cmdarg, regbase::perl | regbase::icase), cmdarg));
-      } catch (...) {
-        cout << "Error: \"" << cmdarg
-             << "\" is not a valid regular expression. Ignored." << endl;
-        display_help = true;
-        continue;
-      }
-      // Flag display rules after all rules have been added
-      display_rules = true;
-    }
-    // Add rule (file #)
-    else if (cmd == "b" || cmd == "file") {
-      if (cmdarg == "") {
-        cout << "Error: Missing index argument" << endl;
-        display_help = true;
-        continue;
-      }
-      u32 idx;
-      try {
-        idx = lexical_cast<u32>(cmdarg);
-        if (idx < 1 || idx > group.size()) {
-          throw(0);
-        }
-      } catch (...) {
-        cout << "Error: \"" << cmdarg << "\" is not a valid index" << endl;
-        display_help = true;
-        continue;
-      }
-      // Since a list doesn't have random access, we walk out to the required
-      // element
-      group_t::iterator group_iter = group.begin();
-      for (u32 d(0); d < idx - 1; ++d) {
-        ++group_iter;
-      }
-      // Escape path_inst for use as regex
-      regex esc("[\\^\\.\\$\\|\\(\\)\\[\\]\\*\\+\\?\\/\\\\]");
-      string rep("\\\\\\1&");
-      string escaped_path_inst(
-        regex_replace(
-          group_iter->path_inst.native(), esc, rep,
-          match_default | format_sed));
-      try {
-        rulelist.push_back(
-          rule(
-            regex(escaped_path_inst, regbase::perl),
-            string("Delete: ") + group_iter->path_inst.native()));
-      } catch (...) {
-        cout << "Error: \"" << cmdarg
-             << "\" is not a valid regular expression. Ignored." << endl;
-        display_help = true;
-        continue;
-      }
-    }
-    // Erase rule
-    else if (cmd == "d" || cmd == "remove") {
-      if (cmdarg == "") {
-        cout << "Error: Missing index argument" << endl;
-        display_help = true;
-        continue;
-      }
-      u32 idx;
-      try {
-        idx = lexical_cast<u32>(cmdarg);
-        if (idx < 1 || idx > rulelist.size()) {
-          throw(0);
-        }
-      } catch (...) {
-        cout << "Error: \"" << cmdarg << "\" is not a valid index" << endl;
-        display_help = true;
-        continue;
-      }
-      // Since a list doesn't have random access, we walk out to the required
-      // element
-      rulelist_t::iterator rule_iter = rulelist.begin();
-      for (u32 d(0); d < idx - 1; ++d) {
-        ++rule_iter;
-      }
-      rulelist.erase(rule_iter);
-      // Flag display rules after all rules have been added
-      display_rules = true;
-    }
-    // Go to next group
-    else if (cmd == "n" || cmd == "next" || cmd == "") {
-      ++groupwalker_iter;
-      ++walkpos;
-      if (groupwalker_iter == groupwalker.end()) {
-        cout << "No more groups" << endl;
-        --groupwalker_iter;
-        --walkpos;
-      }
-    }
-    // Go to previous group
-    else if (cmd == "p" || cmd == "previous") {
-      if (groupwalker_iter == groupwalker.begin()) {
-        cout << "Already at first group" << endl;
-      }
-      else {
-        --groupwalker_iter;
-        --walkpos;
-      }
-    }
-    // Go to first group
-    else if (cmd == "f" || cmd == "first") {
-      if (groupwalker_iter == groupwalker.begin()) {
-        cout << "Already at first group" << endl;
-      }
-      else {
-        groupwalker_iter = groupwalker.begin();
-        walkpos = 1;
-      }
-    }
-    // Go to last group
-    else if (cmd == "" || cmd == "last") {
-      if (walkpos == groupwalker.size()) {
-        cout << "Already at last group" << endl;
-      }
-      else {
-        groupwalker_iter = groupwalker.end();
-        --groupwalker_iter;
-        walkpos = groupwalker.size();
-      }
-    }
-    // Display status
-    else if (cmd == "s" || cmd == "status") {
-      displaystatus = true;
-    }
-#ifdef WIN32
-    // Open file
-    else if (cmd == "o" || cmd == "open") {
-      if (cmdarg == "") {
-        cout << "Error: Missing index argument" << endl;
-        display_help = true;
-        continue;
-      }
-      try {
-        int idx(1);
-        int pidx(lexical_cast<int>(cmdarg));
-        for (group_t::iterator group_iter = group.begin();
-             group_iter != group.end(); ++group_iter) {
-          if (idx == pidx) {
-            stringstream s;
-            s << "start /b \"" << group_iter->path_inst.native() << "\"";
-            // system(s.str().c_str());
-            break;
-          }
-          ++idx;
-        }
-        rulelist.push_back(
-          rule(regex(cmdarg, regbase::perl | regbase::icase), cmdarg));
-      } catch (...) {
-        cout << "Error: \"" << cmdarg << "\" is not a valid index." << endl;
-      }
-    }
-#endif
-    // Delete files
-    else if (cmd == "delete") {
-      displaystatus = false;
-
-      total_stats_t total_stats;
-      file_refs_t files;
-      for (groupmap_t::iterator groupmap_iter = groupmap.begin();
-           groupmap_iter != groupmap.end(); ++groupmap_iter) {
-        get_marked(
-          groupmap_iter, groupmap_iter->second, rulelist, files, total_stats);
-      }
-
-      // Delete confirmation
-      string cmdline("Y");
-      if (!automatic && !quiet) {
-        cout << endl;
-        for (;;) {
-          cout << "About to delete " << total_stats.num_marked << " files ("
-               << total_stats.size_marked << " bytes) Delete? (y/n) > "
-               << flush;
-          getline(cin, cmdline);
-          if (
-            cmdline == "Y" || cmdline == "y" || cmdline == "N"
-            || cmdline == "n")
-            break;
-        }
-      }
-
-      // Do delete
-      if (cmdline == "Y" || cmdline == "y") {
-        u64 file_cnt(0);
-        u64 files_deleted(0);
-        timer time;
-        for (file_refs_t::iterator file_items_iter = files.begin();
-             file_items_iter != files.end(); ++file_items_iter) {
-          did_delete = true;
-          path this_path_inst(file_items_iter->second->path_inst);
-          try {
-            if (!dry_run) {
-              remove(file_items_iter->second->path_inst);
-              ++files_deleted;
-              verbose&& cout << "Deleted by rule: " << this_path_inst.native()
-                             << endl;
-            }
-            else {
-              cout << "Dry-run: Skipped delete: " << this_path_inst.native()
-                   << endl;
-            }
-            // Delete from group (unless filesystem delete exception)
-            file_items_iter->first->second.erase(file_items_iter->second);
-          } catch (const filesystem_error& e) {
-            cout << "Couldn't delete: " << this_path_inst.native() << endl;
-            cout << "Cause: " << e.what() << endl;
-          } catch (...) {
-            cout << "Couldn't delete: " << this_path_inst.native() << endl;
-            cout << "Cause: Unknown exception" << endl;
-          }
-          // Count files deleted
-          ++file_cnt;
-          // Display status if one second has elapsed or this is last iteration
-          if (
-            !quiet
-            && (time.elapsed() >= 1.0 || file_cnt == total_stats.num_marked)) {
-            cout << setprecision(2) << "Deleting: "
-                 << (float)file_cnt / (float)total_stats.num_marked * 100
-                 << "% (" << file_cnt << " / " << total_stats.num_marked
-                 << " files)\n"
-                 << "Failed: " << (file_cnt - files_deleted) << " files\n"
-                 << endl;
-            time.restart();
-          }
-        }
-      }
-
-      displaystatus = true;
-      cleangroups = true;
-      // If in automatic mode, exit here
-      if (automatic)
-        break;
-    }
-    // Display help
-    else if (cmd == "h" || cmd == "help" || cmd == "?") {
-      display_help = true;
-    }
-    // Quit
-    else if (cmd == "quit" || cmd == "exit") {
-      break;
-    }
-    // Unknown command
-    else {
-      cout << "Error: Unknown command" << endl;
-      display_help = true;
-    }
-  } // for (;;)
-
+  // Show final stats after deletes.
+  auto totalStats = getTotalStats(hashToGroupMap, rules);
+  displayTotalStats(totalStats);
   // Success
   exit(0);
 }
 
-// global count of number of files found for processing (in both folders and md5
-// lists)
-bool add_folder(
-  const path& dir_path_inst, const bool recursive, const bool verbose,
-  const bool quiet, u64 smaller, u64 bigger, bool debug)
+// Verify that all provided folder names have legal syntax and exist
+void verifyDirPaths()
 {
-  u64 file_cnt(0);
-  timer time;
-  bool res = add_folder_recursive(
-    dir_path_inst, recursive, verbose, quiet, smaller, bigger, time, file_cnt);
-  // Show debug info about file_map
-  if (debug) {
-    cout << "Debug: file_map size: " << file_map.size() << endl;
-    cout << "Debug: file_map max size: " << file_map.max_size() << endl;
+  bool isInvalid = false;
+  for (auto &p : PATH_VEC_ARG) {
+    isInvalid |= isInvalidDirPath(p);
   }
-  // Print final file count (was probably not printed since we only print a
-  // count every second)
-  cout << "Files: " << file_cnt << endl;
-  return res;
+  for (auto &p : RECURSIVE_PATH_VEC_ARG) {
+    isInvalid |= isInvalidDirPath(p);
+  }
+  for (auto &p : MD5_PATH_VEC_ARG) {
+    isInvalid |= isInvalidDirPath(p);
+  }
+  if (isInvalid) {
+    exit(1);
+  }
 }
 
-// Recursively find file sizes and path_insts and store info in containers
-bool add_folder_recursive(
-  const path& dir_path_inst, const bool recursive, const bool verbose,
-  const bool quiet, u64 smaller, u64 bigger, timer& time, u64& file_cnt)
+// Create vector of files to check for duplicates.
+FileVec findAllFiles()
 {
-  // Check that path_inst is valid and not a symlink
-  if (is_symlink(dir_path_inst) || is_junction(dir_path_inst)) {
-    verbose&& cout << "Skipped symlink: " << dir_path_inst.native() << endl;
-    return false;
+  FileVec fileVec;
+  // Add all files in search folders, non-recursive
+  for (auto &p : PATH_VEC_ARG) {
+    vprint("Processing non-recursive: {}\n", p.native());
+    addPath(fileVec, canonical(p), false);
   }
-  verbose&& cout << "Opening folder: " << dir_path_inst.native() << endl;
+  // Add all files in search folders, recursive
+  for (auto &p : RECURSIVE_PATH_VEC_ARG) {
+    vprint("Processing recursive: {}\n", p.native());
+    addPath(fileVec, canonical(p), true);
+  }
+  // Add all files provided as md5 vectors
+  for (auto &p : MD5_PATH_VEC_ARG) {
+    vprint("Processing MD5 file: {}\n", p.native());
+    addMd5File(fileVec, p);
+  }
+  displayFindStatus(fileVec, true);
+  return fileVec;
+}
+
+// Add a file or directory path.
+void addPath(FileVec &fileVec, const path &itemPath, const bool &recursive)
+{
   try {
-    directory_iterator end_itr;
-    for (directory_iterator itr(dir_path_inst); itr != end_itr; ++itr) {
-      path abs_path_inst(absolute(*itr));
-      try {
-        if (is_directory(abs_path_inst) && !is_symlink(abs_path_inst)) {
-          if (recursive) {
-            add_folder_recursive(
-              *itr, recursive, verbose, quiet, smaller, bigger, time, file_cnt);
-          }
-        }
-        else {
-          if (is_regular_file(abs_path_inst)) {
-            u64 size(file_size(abs_path_inst));
-            // Filter small files if requested
-            if (smaller != -1 && size <= smaller) {
-              // for new boost
-              verbose&& cout
-                << "Skipped <= " << smaller << ": "
-                << str(filesize_row % size % abs_path_inst.native()) << endl;
-            }
-            // Filter big files if requested
-            else if (bigger != -1 && size >= bigger) {
-              verbose&& cout
-                << "Skipped >= " << bigger << ": "
-                << str(filesize_row % size % abs_path_inst.native()) << endl;
-            }
-            else if (!boost::filesystem::is_regular_file(path(file))) {
-              verbose&& cout << "Skipped non-regular file: " << file << endl;
-            }
-            else {
-              // Check if file already is in map (this can happen if user messes
-              // up the search folder arguments
-              // or if some symlink og hardlink is followed (though I'm trying
-              // to avoid that)
-              bool found_path_inst(false);
-              group_t& group(file_map[size]);
-              for (group_t::iterator group_iter(group.begin());
-                   group_iter != group.end(); ++group_iter) {
-                if (group_iter->path_inst == abs_path_inst) {
-                  verbose&& cout
-                    << "Skipped redundant: "
-                    << str(filesize_row % size % abs_path_inst.native())
-                    << endl;
-                  found_path_inst = true;
-                  break;
-                }
-              }
-              if (!found_path_inst) {
-                // Add file to map
-                group.push_back(dup_file(abs_path_inst, size, ""));
-                verbose&& cout
-                  << "Found: "
-                  << str(filesize_row % size % abs_path_inst.native()) << endl;
-              }
-            }
-          }
-          ++file_cnt;
-          // Display status if more than one second has elapsed
-          if (!quiet && time.elapsed() >= 1.0) {
-            cout << "Files: " << file_cnt << endl;
-            time.restart();
-          }
-        }
-      } catch (const filesystem_error& e) {
-        cout << "Error processing: " << abs_path_inst.native() << endl;
-        cout << "Cause: " << e.what() << endl;
-      } catch (...) {
-        cout << "Error processing: " << abs_path_inst.native() << endl;
-        cout << "Cause: Unknown exception" << endl;
+    // Do not follow symlinks and junctions
+    if ((!is_regular_file(itemPath) && !is_directory(itemPath)) || isJunction(itemPath)) {
+      vprint("Ignored special file: {}\n", itemPath.native());
+      return;
+    }
+    if (is_regular_file(itemPath)) {
+      addFile(fileVec, itemPath);
+    }
+    else {
+      vprint("Entering dir: {}\n", itemPath.native());
+      for (const auto &subPath : directory_iterator(itemPath)) {
+        addPath(fileVec, subPath, recursive);
       }
     }
-  } catch (const filesystem_error& e) {
-    cout << "Error: Couldn't open folder: " << dir_path_inst.native() << endl;
-    cout << "Cause: " << e.what() << endl;
-  } catch (...) {
-    cout << "Error: Couldn't open folder: " << dir_path_inst.native() << endl;
-    cout << "Cause: Unknown exception" << endl;
   }
-  return true;
+  catch (const std::exception &e) {
+    fmt::print("Error processing: {}\n", itemPath.native());
+    fmt::print("Cause: {}\n", e.what());
+  }
 }
 
-// Add a list of files generated with md5deep or similar
-//
-// File format is one size, MD5 and full path_inst per line. Example:
-//
+// Add a vector of files generated with md5deep or similar.
+// File format is one size, MD5 and full itemPath per line. Example:
 // 43912  ccd6dad4b72d1255cf2e7a9dadd64083  C:\Documents and
 // Settings\Administrator\Desktop\test.txt
-bool add_md5list(
-  const path& md5deep_file, const bool verbose, const bool quiet, u64 smaller,
-  u64 bigger, bool debug)
+void addMd5File(FileVec &fileVec, const path &md5DeepPath)
 {
   regex md5line(" *([0-9]+) +([0-9a-fA-F]{32}) +(.*)");
   boost::smatch what;
-  timer time;
-  u64 file_cnt(0);
-
+  size_t fileCount(0);
   // Open file for reading
-  std::wifstream fi(md5deep_file.native().c_str());
+  std::wifstream fi(md5DeepPath.native().c_str());
   if (!fi.good()) {
-    cout << "Error: Couldn't open file" << endl;
-    return false;
+    fmt::print("Error: Couldn't open file: {}\n", md5DeepPath);
+    return;
   }
 
   while (fi.good()) {
     // Count processed files
-    file_cnt++;
-
+    fileCount++;
     // Get line
     string line;
     // getline(fi, line); TODO
     trim(line);
-
     // Ignore empty lines
-    if (line == "")
+    if (line.empty()) {
       continue;
-
-    // Parse line into size, md5 and path_inst
+    }
+    // Parse line into size, md5 and itemPath
     if (!regex_search(line, what, md5line)) {
-      cout << "Error: Malformed line in md5 file:" << endl;
-      cout << "\"" << line << "\"" << endl;
+      fmt::print("Error: Malformed line in md5 file: {}\n", md5DeepPath);
+      fmt::print("Line: {}\n", line);
       continue;
     }
-    string size_str(what[1].first, what[1].second);
+    string sizeStr(what[1].first, what[1].second);
     string md5(what[2].first, what[2].second);
-    string file(what[3].first, what[3].second);
+    string filePath(what[3].first, what[3].second);
+    addFile(fileVec, filePath);
+  }
+}
 
-    u64 size = lexical_cast<u64>(size_str);
+void addFile(FileVec &fileVec, const path &filePath)
+{
+  auto absFilePath = canonical(filePath);
+  auto fileSize = filesystem::file_size(absFilePath);
+  // Filter small files if requested
+  if (IGNORE_SMALLER_ARG != (size_t)-1 && fileSize <= IGNORE_SMALLER_ARG) {
+    vprint(
+      "Ignored small file (< {:n}): {:n} {}\n", IGNORE_SMALLER_ARG, fileSize, absFilePath.native());
+    return;
+  }
+  // Filter large files if requested
+  if (IGNORE_LARGER_ARG != (size_t)-1 && fileSize >= IGNORE_LARGER_ARG) {
+    vprint("Ignored large file (> {:n}): {:n} {}\n", IGNORE_LARGER_ARG, fileSize,
+      absFilePath.native(), absFilePath.native());
+    return;
+  }
+  // Add file
+  auto fileInfo = FileInfo(absFilePath, fileSize, "");
+  fileVec.push_back(fileInfo);
+  vprint("Found: {}\n", fileInfo.str());
+  displayFindStatus(fileVec);
+}
 
-    // Filter small files if requested
-    if (smaller != -1 && size <= smaller) {
-      verbose&& cout << "Skipped <= " << smaller << ": "
-                     << str(filesize_row % size % file) << endl;
-    }
-    // Filter big files if requested
-    else if (bigger != -1 && size >= bigger) {
-      verbose&& cout << "Skipped >= " << bigger << ": "
-                     << str(filesize_row % size % file) << endl;
-    }
-    else if (!boost::filesystem::is_regular_file(path(file))) {
-      verbose&& cout << "Skipped non-regular file: " << file << endl;
+// Display status if more than one second has elapsed
+void displayFindStatus(const FileVec &fileVec, bool forceDisplay)
+{
+  if (forceDisplay || (!QUIET_ARG && LAST_STATUS_TIME.elapsed() >= 1.0)) {
+    fmt::print("Files found: {:n}\n", fileVec.size());
+    LAST_STATUS_TIME.restart();
+  }
+}
+
+SizeToGroupMap groupFilesBySize(const FileVec &fileVec)
+{
+  SizeToGroupMap sizeToGroupMap;
+  for (auto &fileInfo : fileVec) {
+    sizeToGroupMap[fileInfo.size].push_back(fileInfo);
+  }
+  return sizeToGroupMap;
+}
+
+// Remove groups with only one item. These file in the group has unique file size or hash so
+// cannot have duplicates.
+template <typename GroupMap> void removeSingleItemGroups(GroupMap &groupMap)
+{
+  size_t removedCount = 0;
+  auto iter = groupMap.begin();
+  while (iter != groupMap.end()) {
+    if (iter->second.size() <= 1) {
+      iter = groupMap.erase(iter);
+      ++removedCount;
     }
     else {
-      // Process file
-      file_map[size].push_back(dup_file(path(file), size, md5));
-      verbose&& cout << "Found: " << str(filesize_row % size % file) << endl;
-    }
-    // Display progress once every second
-    if (!quiet && time.elapsed() >= 1.0) {
-      cout << "Files: " << file_cnt << endl;
-      time.restart();
+      ++iter;
     }
   }
-  // Display final count (probably wasn't displayed above since we display only
-  // once per second)
-  if (!quiet) {
-    cout << "Files: " << file_cnt++ << endl;
+  if (removedCount) {
+    fmt::print("Filtered out {:n} single item or empty groups\n", removedCount);
   }
-  // Show debug info about file_map
-  if (debug) {
-    cout << "Debug: file_map size: " << file_map.size() << endl;
-    cout << "Debug: file_map max size: " << file_map.max_size() << endl;
-  }
-  return true;
 }
 
-// Get all files that are marked in a group
-void get_marked(
-  groupmap_t::iterator& groupmap_iter, group_t& group, rulelist_t& rules,
-  file_refs_t& files, total_stats_t& total_stats)
+// Calculate hashes for all files.
+void hashAll(FileVec &fileVec)
 {
-  u64 file_size(0);
-  u32 num_marked(0);
-  for (group_t::iterator group_iter = group.begin(); group_iter != group.end();
-       ++group_iter) {
-    // Update total stats
-    if (!file_size) {
-      file_size = group_iter->size;
+  auto totalSizeOfUnhashed = getTotalSizeOfUnhashed(fileVec);
+  size_t accumulatedSize(0);
+  for (auto &fileInfo : fileVec) {
+    accumulatedSize += fileInfo.size;
+    try {
+      calculateHash(fileInfo);
     }
-    // If we have marked all but one file in group, exit (no rule can mark all
-    // files in one group)
-    if (num_marked + 1 == group.size()) {
-      break;
+    catch (std::exception &e) {
+      fmt::print("Ignored file: {}\n", fileInfo.itemPath.native());
+      fmt::print("Cause: {}\n", e.what());
     }
-    // Run all rules on group
-    for (list<rule>::iterator rules_iter = rules.begin();
-         rules_iter != rules.end(); ++rules_iter) {
-      if (regex_search(group_iter->path_inst.native(), rules_iter->rx)) {
-        ++num_marked;
-        files.push_back(file_ref_t(groupmap_iter, group_iter));
-        // Don't try any other rules when we get a match (would create duplicate
-        // delete entries)
-        break;
+    displayHashStatus(
+      fileInfo, accumulatedSize, totalSizeOfUnhashed, fileVec.size(), fileVec.size());
+  }
+}
+
+void calculateHash(FileInfo &fileInfo)
+{
+  if (!fileInfo.hash.empty()) {
+    return;
+  }
+  if (USE_MD5_ARG) {
+    std::ifstream f(fileInfo.itemPath.native(), ios::binary);
+    string ck(md5(f).digest().hex_str_value());
+    string wck(ck.begin(), ck.end());
+    fileInfo.hash = wck;
+  }
+  else {
+    fileInfo.hash = fnv1A64(fileInfo.itemPath);
+  }
+  vprint("{}: {}\n", USE_MD5_ARG ? "MD5 " : "FNV64", fileInfo.str());
+}
+
+void displayHashStatus(const FileInfo &fileInfo, size_t accumulatedSize, size_t totalSize,
+  size_t fileCount, size_t fileIdx)
+{
+  if (!QUIET_ARG && totalSize &&
+    (LAST_STATUS_TIME.elapsed() >= 1.0 || accumulatedSize == totalSize)) {
+    fmt::print("Calculating {} hashes:\n", USE_MD5_ARG ? "MD5" : "FNV64");
+    fmt::print("Data: {:.2f}% ({:n} / {:n} bytes)\n",
+      (float)accumulatedSize / (float)totalSize * 100, accumulatedSize, totalSize);
+    fmt::print("Files: {:.2f}% ({:n} / {:n} files)\n", (float)fileIdx / (float)fileCount * 100,
+      fileIdx, fileCount);
+    LAST_STATUS_TIME.restart();
+  }
+}
+
+// Sum up the total size of files to hash.
+// The vector may include entries imported from md5 files, which includes hash.
+size_t getTotalSizeOfUnhashed(FileVec &fileVec)
+{
+  size_t totalSize(0);
+  for (const auto &fileInfo : fileVec) {
+    if (fileInfo.hash.empty()) {
+      totalSize += fileInfo.size;
+    }
+  }
+  return totalSize;
+}
+
+HashToGroupMap groupFilesByHash(const FileVec &fileVec)
+{
+  HashToGroupMap hashToGroupMap;
+  for (const auto &fileInfo : fileVec) {
+    hashToGroupMap[fileInfo.hash].push_back(fileInfo);
+  }
+  return hashToGroupMap;
+}
+
+void addRulesFromCommandLine(Rules &rules)
+{
+  for (auto &ruleArg : RULE_VEC_ARG) {
+    rules.addRegexRule(ruleArg);
+  }
+}
+
+// Sort the FileVec in each group by the itemPaths.
+void sortAllFileInfoVec(HashToGroupMap &hashToGroupMap)
+{
+  for (auto &groupPair : hashToGroupMap) {
+    std::sort(std::begin(groupPair.second), std::end(groupPair.second),
+      [](const FileInfo &a, const FileInfo &b) { return a.itemPath < b.itemPath; });
+  }
+}
+
+GroupsBySizeVec sortGroupsBySize(const HashToGroupMap &hashToGroupMap)
+{
+  GroupsBySizeVec groupsBySize;
+  for (auto &groupPair : hashToGroupMap) {
+    groupsBySize.push_back(groupPair.first);
+  }
+
+  std::sort(std::begin(groupsBySize), std::end(groupsBySize), CompareGroupsByHash(hashToGroupMap));
+  return groupsBySize;
+}
+
+// Start interactive section
+void addRulesInteractive(Rules &rules, HashToGroupMap &groupMap)
+{
+  bool doDisplayHelp = true;
+  size_t groupIdx = 0;
+  GroupsBySizeVec groupsBySize;
+  string errorMsg;
+  fmt::print("\n");
+
+  for (;;) {
+    refreshGroups(groupsBySize, groupMap);
+    // Exit if no more groups
+    if (groupMap.empty()) {
+      if (!QUIET_ARG) {
+        fmt::print("No more duplicates found\n");
+      }
+      return;
+    }
+    const auto &groupFileVec = groupMap[groupsBySize[groupIdx]];
+    auto totalStats = getTotalStats(groupMap, rules);
+    displayRules(rules);
+    displayGroup(groupFileVec, rules, groupIdx, totalStats.groupCount);
+    displayTotalStats(totalStats);
+    if (doDisplayHelp) {
+      doDisplayHelp = false;
+      displayHelp();
+    }
+    if (!errorMsg.empty()) {
+      fmt::print("\n{:>4}Error:\n{:>15}{}\n", "", "", errorMsg);
+      errorMsg.clear();
+    }
+    try {
+      string cmd, arg;
+      commandPrompt(cmd, arg, groupIdx, totalStats.groupCount);
+      // Exit program without deleting the marked files (if any).
+      if (cmd == "quit" || cmd == "exit") {
+        return;
+      }
+      procCommand(
+        groupIdx, doDisplayHelp, rules, totalStats, groupFileVec, cmd, arg, groupMap);
+    }
+    catch (const std::runtime_error &e) {
+      errorMsg = e.what();
+    }
+  }
+}
+
+void procCommand(size_t &groupIdx, bool &doDisplayHelp, Rules &rules, const Stats &totalStats,
+  const FileVec &groupFileVec, const string &cmd, const string &arg, HashToGroupMap &groupMap)
+{
+  auto newGroupIdx = goToGroup(groupIdx, totalStats.groupCount, cmd);
+  if (newGroupIdx != groupIdx) {
+    groupIdx = newGroupIdx;
+    return;
+  }
+  if (cmd == "delete") {
+    if (!totalStats.markedBytes) {
+      throw runtime_error("Nothing to delete yet");
+    }
+    // Prompt for confirmation then delete the currently marked files.
+    if(confirmDeletePrompt(totalStats)){
+      deleteMarkedFiles(groupMap, rules);
+      removeSingleItemGroups(groupMap);
+      rules.clear();
+    }
+    return;
+  }
+  // Erase a rule
+  if (cmd == "d" || cmd == "remove") {
+    rules.eraseRule(argToIdx(arg, rules.getRuleCount()));
+    return;
+  }
+  // Display help
+  if (cmd == "h" || cmd == "help" || cmd == "?") {
+    doDisplayHelp = true;
+    return;
+  }
+  // Add path rule if cmd is a number
+  try {
+    lexical_cast<size_t>(cmd);
+    rules.addPathRule(groupFileVec[argToIdx(cmd, groupFileVec.size()) - 1].itemPath);
+    return;
+  }
+  catch (std::exception& e) {}
+  // Add regex rule if cmd is a regex
+  if (cmd.size() >= 2) {
+    rules.addRegexRule(cmd);
+    return;
+  }
+  throw runtime_error(fmt::format("Unknown command: {}", cmd));
+}
+
+void commandPrompt(string &cmd, string &arg, const size_t groupIdx, const size_t groupCount)
+{
+  string cmdline;
+  fmt::print("\n    {:n} / {:n} > ", groupIdx + 1, groupCount);
+  cout << flush;
+  getline(cin, cmdline);
+  // Split command into command and argument
+  size_t spaceIdx = cmdline.find(' ');
+  cmd = cmdline.substr(0, spaceIdx);
+  trim(cmd);
+  if (spaceIdx != (size_t)-1) {
+    arg = cmdline.substr(spaceIdx);
+    trim(arg);
+  }
+}
+
+size_t goToGroup(size_t groupIdx, size_t groupCount, const string &cmd)
+{
+  if (cmd == "f" || cmd == "first") {
+    if (groupIdx == 0) {
+      throw runtime_error("Already at the first group");
+    }
+    groupIdx = 0;
+  }
+  else if (cmd == "p" || cmd == "previous") {
+    if (groupIdx == 0) {
+      throw runtime_error("Already at the first group");
+    }
+    --groupIdx;
+  }
+  else if (cmd == "l" || cmd == "last") {
+    if (groupIdx == groupCount - 1) {
+      throw runtime_error("Already at the last group");
+    }
+    groupIdx = groupCount - 1;
+  }
+  else if (cmd == "n" || cmd == "next" || cmd.empty()) {
+    if (groupIdx == groupCount - 1) {
+      throw runtime_error("Already at the last group");
+    }
+    ++groupIdx;
+  }
+  return groupIdx;
+}
+
+size_t argToIdx(const string &arg, const size_t &maxIdx)
+{
+  size_t idx;
+  if (arg.empty()) {
+    throw std::runtime_error("Missing index argument");
+  }
+  try {
+    idx = lexical_cast<size_t>(arg);
+  }
+  catch (std::exception &e) {
+    throw std::runtime_error(fmt::format("Invalid index: {}", arg));
+  }
+  if (idx < 1 || idx > maxIdx) {
+    throw std::runtime_error(fmt::format("Index must be between 1 and {}", maxIdx));
+  }
+  return idx;
+}
+
+void refreshGroups(GroupsBySizeVec &groupsBySize, HashToGroupMap &groupMap)
+{
+  removeSingleItemGroups(groupMap);
+  groupsBySize = sortGroupsBySize(groupMap);
+}
+
+bool isInvalidDirPath(const path &p)
+{
+  if (!is_directory(p)) {
+    fmt::print("Invalid path: {}\n", p.native());
+    return true;
+  }
+  return false;
+}
+
+void displayRules(const Rules &rules)
+{
+  auto ruleVec = rules.getRulesForDisplay();
+  fmt::print("\n    Rules:\n");
+  if (ruleVec.empty()) {
+    fmt::print("              No rules defined\n");
+  }
+  else {
+    int ruleIdx(0);
+    for (const auto &r : ruleVec) {
+      fmt::print("           {:>3n}: {}\n", ++ruleIdx, r);
+    }
+  }
+}
+
+void displayGroup(
+  const FileVec &fileVec, const Rules &rules, const size_t groupIdx, const size_t groupCount)
+{
+  fmt::print("\n    Duplicates:\n", groupIdx + 1, groupCount);
+  size_t fileIdx = 0;
+  size_t matchedCount = 0;
+  for (const auto &fileInfo : fileVec) {
+    bool isMatch = rules.isMatch(fileInfo);
+    if (isMatch) {
+      ++matchedCount;
+      // Don't mark the last file in the group if it would cause all files in the group to be
+      // marked. This is to ensure that the program never deletes all files in a group.
+      if (matchedCount == fileVec.size()) {
+        isMatch = false;
       }
     }
+    fmt::print("{:>9}{} {:>3n} {}\n", "", isMatch ? '*' : ' ', ++fileIdx, fileInfo.itemPath.native());
   }
-  // Update total stats
-  total_stats.num_total += (u32)group.size();
-  total_stats.num_dup += (u32)group.size() - 1;
-  total_stats.num_marked += num_marked;
-  total_stats.size_total += group.size() * file_size;
-  total_stats.size_dup += (group.size() - 1) * file_size;
-  total_stats.size_marked += num_marked * file_size;
+  auto groupStats = getGroupStats(fileVec, rules);
+  fmt::print("\n");
+  fmt::print("{:>14n} bytes per file, all with hash {}\n", fileVec[0].size, fileVec[0].hash);
+  fmt::print("{:>14n} bytes in group\n", groupStats.totalBytes);
+  fmt::print("{:>14n} bytes in duplicates\n", groupStats.dupBytes);
+  fmt::print("{:>14n} bytes in marked files\n", groupStats.markedBytes);
 }
 
-void parse_command_line(int argc, char* argv[])
+void displayHelp()
+{
+  fmt::print("\n    Commands:\n");
+  fmt::print("        {:<15}{}\n", "<Enter>",         "go to next group");
+  fmt::print("        {:<15}{}\n", "f (first)",       "go to first group");
+  fmt::print("        {:<15}{}\n", "l (last)",        "go to last group");
+  fmt::print("        {:<15}{}\n", "p (previous)",    "go to previous group");
+  fmt::print("        {:<15}{}\n", "regex string",    "add rule to delete all files in all groups matching the regex");
+  fmt::print("        {:<15}{}\n", "index number",    "add rule to delete the single file with given index in the group");
+  fmt::print("        {:<15}{}\n", "d (index)",       "remove rule");
+  fmt::print("        {:<15}{}\n", "h, help, ?",      "display this message");
+  fmt::print("        {:<15}{}\n", "exit",            "exit program without deleting anything");
+  fmt::print("        {:<15}{}\n", "delete",          "prompt, then delete all marked files");
+}
+
+void displayTotalStats(const Stats &stats)
+{
+  fmt::print("\n    Total:\n");
+  fmt::print("{:>14n} files\n", stats.totalCount);
+  fmt::print("{:>14n} groups\n", stats.groupCount);
+  fmt::print("{:>14n} duplicates\n", stats.dupCount);
+  fmt::print("{:>14n} marked files\n", stats.markedCount);
+  fmt::print("{:>14n} bytes in all groups\n", stats.totalBytes);
+  fmt::print("{:>14n} bytes in duplicates\n", stats.dupBytes);
+  fmt::print("{:>14n} bytes in all marked files\n", stats.markedBytes);
+  fmt::print(
+    "{:>14.2f} files per group (average)\n", (float)stats.totalCount / (float)stats.groupCount);
+}
+
+bool confirmDeletePrompt(const Stats &totalStats)
+{
+  fmt::print("\n");
+  while (true) {
+    fmt::print("About to delete {:n} files ({:n} bytes) Delete? (y/n) > ", totalStats.markedCount,
+      totalStats.markedBytes);
+    cout << flush;
+    string cmdline;
+    getline(cin, cmdline);
+    if (cmdline == "Y" || cmdline == "y") {
+      fmt::print("\n");
+      return true;
+    }
+    if (cmdline == "N" || cmdline == "n") {
+      fmt::print("\n");
+      return false;
+    }
+  }
+}
+
+void deleteMarkedFiles(HashToGroupMap &groupMap, const Rules &rules)
+{
+  size_t deletedCount = 0;
+  size_t deleteIdx = 0;
+  auto totalStats = getTotalStats(groupMap, rules);
+
+  for (auto &groupPair : groupMap) {
+    auto &fileVec = groupPair.second;
+    auto fileIter = fileVec.begin();
+    while (fileIter != fileVec.end()) {
+      if (rules.isMatch(*fileIter)) {
+        if (deleteFile(*fileIter)) {
+          ++deletedCount;
+        }
+        fileIter = fileVec.erase(fileIter);
+      }
+      else {
+        ++fileIter;
+      }
+      ++deleteIdx;
+      displayDeleteStatus(totalStats, deleteIdx, deletedCount);
+    }
+  }
+}
+
+bool deleteFile(const FileInfo &fileInfo)
+{
+  try {
+    if (DRY_RUN_ARG) {
+      fmt::print("Dry-run: Skipped delete: {}\n", fileInfo.itemPath.native());
+    }
+    else {
+      // remove(file.second->itemPath);
+      vprint("Deleted: {}\n", fileInfo.itemPath.native());
+    }
+    return true;
+  }
+  catch (const filesystem_error &e) {
+    fmt::print("Couldn't delete: {}\n", fileInfo.itemPath.native());
+    fmt::print("Cause: {}\n", e.what());
+  }
+  catch (...) {
+    fmt::print("Couldn't delete: {}\n", fileInfo.itemPath.native());
+    fmt::print("Cause: Unknown exception\n");
+  }
+  return false;
+}
+
+void displayDeleteStatus(const Stats &totalStats, const size_t deleteIdx, const size_t deletedCount)
+{
+  // Display status if one second has elapsed or this is last iteration
+  if (QUIET_ARG || (LAST_STATUS_TIME.elapsed() < 1.0)) {
+    return;
+  }
+  fmt::print("Deleting files: {:.2f}% ({:n} / {:n})\n",
+    (float)deleteIdx / (float)totalStats.markedCount * 100, deleteIdx, totalStats.markedCount);
+  fmt::print("Failed: {:n} markedFiles\n", deleteIdx - deletedCount);
+  LAST_STATUS_TIME.restart();
+}
+
+Stats getGroupStats(const FileVec &groupFileVec, const Rules &rules)
+{
+  Stats stats;
+  size_t fileIdx = 0;
+  for (const auto &fileInfo : groupFileVec) {
+    stats.totalCount += 1;
+    stats.totalBytes += fileInfo.size;
+    stats.groupCount = 1;
+    if (fileIdx) {
+      stats.dupCount += 1;
+      stats.dupBytes += fileInfo.size;
+    }
+    if (rules.isMatch(fileInfo)) {
+      // Don't mark the last file in the group if it would cause all files in the group to be
+      // marked. This is to ensure that the program never deletes all files in a group.
+      if (stats.markedCount != groupFileVec.size() - 1) {
+        stats.markedCount += 1;
+        stats.markedBytes += fileInfo.size;
+      }
+    }
+    ++fileIdx;
+  }
+  return stats;
+}
+
+Stats getTotalStats(const HashToGroupMap &groupMap, const Rules &rules)
+{
+  Stats stats;
+  for (const auto &group : groupMap) {
+    auto groupStats = getGroupStats(group.second, rules);
+    stats += groupStats;
+  }
+  return stats;
+}
+
+// Switch from C locale to user's locale. This works together with the fmt "{:n}" for adding
+// thousand grouping to all ints for US locale and hopefully most others.
+void setupLocale()
+{
+  locale::global(locale(""));
+}
+
+void parseCommandLine(int argc, char **argv)
 {
   try {
     options_description desc("Duplex - Delete duplicate files - dahlsys.com");
-    desc.add_options()("help,h", "produce help message")(
-      "dry-run,d", bool_switch(&dry_run),
-      "don't delete anything, just simulate")(
-      "automatic,a", bool_switch(&automatic),
-      "don't enter interactive mode (delete without confirmation)")(
-      "filter-small,s", value<u64>(&smaller),
-      "ignore files of this size and smaller")(
-      "filter-big,b", value<u64>(&bigger),
-      "ignore files of this size and bigger")(
-      "quiet,q", bool_switch(&quiet), "display only error messages")(
-      "verbose,v", bool_switch(&verbose), "display verbose messages")(
-      "debug,e", bool_switch(&debug), "display debug / optimization info")(
-      "md5,5", bool_switch(&use_md5),
-      "use md5 cryptographic hash (fnv 64 bit hash is used by default)")(
-      "rule,u", value<vector<string> >(&rule_args),
-      "add marking rule (case insensitive regex)")(
-      "rfolder,r", value<vector<string> >(&rfolder_args),
-      "add recursive search folder")(
-      "md5list,m", value<vector<string> >(&md5list_args),
-      "add md5 list file (output from md5deep -zr)")(
-      "folder,f", value<vector<string> >(&folder_args), "add search folder");
+    desc.add_options()("help,h", "produce help message")("dry-run,d", bool_switch(&DRY_RUN_ARG),
+      "don't delete anything, just simulate")("automatic,a", bool_switch(&AUTOMATIC_ARG),
+      "don't enter interactive mode (delete without confirmation)")("filter-small,s",
+      value<size_t>(&IGNORE_SMALLER_ARG), "ignore files of this size and smaller")(
+      "filter-large,b", value<size_t>(&IGNORE_LARGER_ARG), "ignore files of this size and larger")(
+      "quiet,q", bool_switch(&QUIET_ARG), "display only error messages")("verbose,v",
+      bool_switch(&VERBOSE_ARG), "display verbose messages")("debug,e", bool_switch(&DEBUG_ARG),
+      "display debug / optimization info")("md5,5", bool_switch(&USE_MD5_ARG),
+      "use md5 cryptographic hash (fnv 64 bit hash is used by default)")("rule,u",
+      value<vector<string>>(&RULE_VEC_ARG),
+      "add marking rule (case insensitive regex)")("rfolder,r",
+      value<vector<path>>(&RECURSIVE_PATH_VEC_ARG), "add recursive search folder")("md5list,m",
+      value<vector<path>>(&MD5_PATH_VEC_ARG), "add md5 list file (output from md5deep -zr)")(
+      "folder,f", value<vector<path>>(&PATH_VEC_ARG), "add search folder");
 
     positional_options_description p;
     p.add("rfolder", -1);
-
     variables_map vm;
     store(command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
     notify(vm);
-
     // Display help and exit if required options (yes, I know) are missing
-    if (
-      vm.count("help") || (!folder_args.size() && !rfolder_args.size()
-                           && !md5list_args.size())) {
-      cout << desc << endl
-           << "Arguments are equivalent to rfolder options" << endl;
+    if (vm.count("help") ||
+      (PATH_VEC_ARG.empty() && RECURSIVE_PATH_VEC_ARG.empty() && MD5_PATH_VEC_ARG.empty())) {
+      fmt::print("{}\nArguments are equivalent to rfolder options\n", desc);
       exit(1);
     }
-
     // Switch to md5 hashes if md5lists are used
-    if (md5list_args.size()) {
-      verbose&& cout << "Enabled md5 hashes due to md5list being used" << endl;
-      use_md5 = true;
+    if (!MD5_PATH_VEC_ARG.empty()) {
+      fmt::print("Enabled md5 hashes due to md5list being used\n");
+      USE_MD5_ARG = true;
     }
-  } catch (std::exception& e) {
-    cerr << "Error: " << e.what() << endl;
+  }
+  catch (std::exception &e) {
+    fmt::print("Error: {}\n", e.what());
     exit(1);
-  } catch (...) {
-    cerr << "Error: Unknown exception" << endl;
-    ;
+  }
+  catch (...) {
+    fmt::print("Error: Unknown exception\n");
     exit(1);
   }
 }
 
-// Verify that all provided folder names have legal syntax and exist
-void verify_valid_folders()
-{
-  vector<string>::iterator i;
-  try {
-    for (i = folder_args.begin(); i != folder_args.end(); ++i) {
-      if (!exists(*i) || !is_directory(*i)) {
-        throw 0;
-      }
-    }
-    for (i = rfolder_args.begin(); i != rfolder_args.end(); ++i) {
-      if (!exists(*i) || !is_directory(*i)) {
-        throw 0;
-      }
-    }
-    for (i = md5list_args.begin(); i != md5list_args.end(); ++i) {
-      if (!exists(*i) || is_directory(*i)) {
-        throw 0;
-      }
-    }
-  } catch (...) {
-    cout << "Error: Illegal path_inst: " << endl;
-    cout << *i << endl;
-    exit(1);
-  }
-}
-
-// Comparison for dup_file pointers
-bool compare_dup_file(dup_file* _first, dup_file* _second)
-{
-  return _first->path_inst.native() < _second->path_inst.native();
-  // string first(_first->path_inst.native());
-  // string second(_second->path_inst.native());
-  // unsigned int i(0);
-  // while ((i < first.length()) && (i < second.length())) {
-  //  if (tolower(first[i]) < tolower(second[i])) {
-  //    return true;
-  //  }
-  //  else if (tolower(first[i]) > tolower(second[i])) {
-  //    return false;
-  //  }
-  //  ++i;
-  //}
-  // if (first.length()<second.length()) {
-  //  return true;
-  //}
-  // return false;
-}
+#pragma clang diagnostic pop
