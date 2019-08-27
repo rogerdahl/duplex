@@ -59,14 +59,12 @@ Interactive mode commands
 Example
 ~~~~~~~
 
-Example view of a group of 3 duplicates. One regex rule selecting any file containing the string ``orig`` and one
- path rule, selecting the specific file ``tmp/edit.tmp`` have been added. Stars show the files marked for deletion
- by the current rules. The prompt shows that this is group 5 of 6.
+Example view of a group of 3 duplicates. One regex rule selecting any file containing the string ``fixed`` and one  path rule, selecting the specific file ``tmp/edit.tmp`` have been added. Stars show the files marked for deletion by the current rules. The prompt shows that this is group 5 of 6.
 
 ::
 
    Rules:
-               orig
+               fixed
                tmp/edit.tmp
 
     Duplicates:
@@ -117,7 +115,7 @@ Strategy
 
 * Calculate hashes for remaining files and group them by hash.
 
-* Remove all groups that have only one member (they can't have duplicates).
+* Remove from consideration all files that have unique hashes (they can't have duplicates).
 
 * Enter interactive mode which allows user to view groups of duplicates and specify rules for which files to delete.
 
@@ -184,4 +182,12 @@ Todo
 
 Implement more rule types for selecting files to delete:
 
-* Delete all but specific file in group. * Delete all but shortest filename in group. * Delete all but shortest filename in all groups. * Delete all but longest filename in group. * Delete all but longest filename in all groups. * Delete all but shortest pathname in group. * Delete all but shortest pathname in all groups. * Delete all but longest pathname in group. * Delete all but longest pathname in all groups.
+* Delete all but specific file in group
+* Delete all but shortest filename in group
+* Delete all but shortest filename in all groups
+* Delete all but longest filename in group
+* Delete all but longest filename in all groups
+* Delete all but shortest pathname in group
+* Delete all but shortest pathname in all groups
+* Delete all but longest pathname in group
+* Delete all but longest pathname in all groups
