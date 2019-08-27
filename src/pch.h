@@ -1,12 +1,13 @@
 #pragma once
 //#pragma message("Compiling PCH - Should only happen once per project")
 
-// Misc
+// Local libraries
 #define _CRT_SECURE_NO_DEPRECATE
 #define _SCL_SECURE_NO_DEPRECATE
 #include "targetver.h"
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+//#include <spdlog/spdlog.h>
 
 // Boost
 #define BOOST_FILESYSTEM_VERSION 3
@@ -23,28 +24,19 @@
 #include <boost/scoped_ptr.hpp>
 
 // Std
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
-#include <fstream>
 #include <list>
-#include <map>
-#include <utility>
-
-#ifdef WIN32
-#include <hash_map>
-#include <hash_set>
-#else
-#include <unordered_map>
-//#include <ext/hash_map>
-//#include <ext/hash_set>
-#endif
-
-#include <string>
-#include <algorithm>
-#include <vector>
-#include <sstream>
-#include <iomanip>
 #include <locale>
+#include <map>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 // App
 #include "int_types.h"

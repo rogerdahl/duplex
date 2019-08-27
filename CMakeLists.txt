@@ -4,17 +4,14 @@ project(duplex)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
-# https://cmake.org/cmake/help/v3.0/policy/CMP0015.html
-#cmake_policy(SET "CMP0015" "NEW")
-
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 set(SOURCE_DIR ${CMAKE_SOURCE_DIR}/src)
 
-#if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-#	set(LIBRARIES ${CMAKE_SOURCE_DIR}/libraries/linux)
-#else()
-#	set(LIBRARIES ${CMAKE_SOURCE_DIR}/libraries/win64)
-#endif()
+if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+	set(LIBRARIES ${CMAKE_SOURCE_DIR}/libraries/linux)
+else()
+	set(LIBRARIES ${CMAKE_SOURCE_DIR}/libraries/win64)
+endif()
 
 # Boost
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -51,16 +48,19 @@ set(SOURCE_FILES
 )
 
 include_directories(
+#  ${LIBRARIES}/spdlog/include
   ${BOOST_INCLUDE_DIR}
 )
 
 link_directories(
+#  ${LIBRARIES}/spdlog/build
   ${BOOST_LINK_DIR}
 )
 
 link_libraries(
   ${BOOST_LIBRARIES}
   fmt
+#  spdlog
   # For Windows, the boost libraries are not required here because Boost
   # supports VS' autolink feature
 )
