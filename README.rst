@@ -1,7 +1,7 @@
 duplex - Interactively delete duplicate files
 =============================================
 
-A interactive duplicate file removal utility that can handle arbitrarily sized folders and allows setting up rules for which files to delete. Rules can be specified while viewing groups of duplicates in an interactive session or passed on the command line and run automatically.
+An interactive duplicate file removal utility that can handle arbitrarily sized folders and allows setting up rules for which files to delete. Rules can be specified while viewing groups of duplicates in an interactive session or passed on the command line and run automatically.
 
 Usage
 -----
@@ -63,7 +63,7 @@ Example view of a group of 3 duplicates. One regex rule selecting any file conta
 
 ::
 
-   Rules:
+    Rules:
                fixed
                tmp/edit.tmp
 
@@ -145,7 +145,7 @@ given n random integers drawn from a discrete uniform distribution with range [1
 
 Plugging in the numbers for 1,000,000 files and a 32 bit hash yields a 100% probability of collisions. 100,000 files gives a 69% probability. In the app, the file size is added to the hash to get some more entropy, but since file sizes are not necessarily non-uniform, yielding small groups of files with the same size, a 32 bit hash is obviously out of the question.
 
-Repeating the exercise for 1,000,000 files and 64 bit hash yields a 0.0000027% probability. That is in the worst case scenario of all 1,000,000 files having the same size. That seemed good enough, so a fast 64 bit hash called FNV1a was selected as the default option. However, an MD5 mode that can be enabled with the ``--md5`` option was also implemented. MD5 is a 128 bit hash, which yields a 1.46e-25 probability of collisions. That number is so low that the formula could not be evaluated with regular double precision floats. An arbitrary-precision library and 40 digits of precision had to be used.
+Repeating the calculation for 1,000,000 files and 64 bit hash yields a 0.0000027% probability. That is in the worst case scenario of all 1,000,000 files having the same size. That seemed good enough, so a fast 64 bit hash called FNV1a was selected as the default option. However, an MD5 mode that can be enabled with the ``--md5`` option was also implemented. MD5 is a 128 bit hash, which yields a 1.46e-25 probability of collisions. That number is so low that the formula could not be evaluated with regular double precision floats. An arbitrary-precision library and 40 digits of precision had to be used.
 
 Performance
 ~~~~~~~~~~~
